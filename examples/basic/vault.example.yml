@@ -1,0 +1,5 @@
+---
+# Copy to vault.yml, replace every placeholder, and encrypt the file.
+vault_zabbix_api_password: REPLACE_WITH_ZABBIX_API_PASSWORD
+vault_zabbix_agent_psks:
+  app-01.example.test: REPLACE_WITH_64_LOWERCASE_HEXADECIMAL_CHARACTERS

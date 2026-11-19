@@ -1,0 +1,119 @@
+---
+- name: Require firewalld already active before mutation
+  ansible.builtin.command: systemctl is-active firewalld
+  register: _zabbix_onboarding_firewalld_active
+  changed_when: false
+  failed_when: _zabbix_onboarding_firewalld_active.rc != 0 or _zabbix_onboarding_firewalld_active.stdout != 'active'
+
+- name: Resolve management IP interface
+  ansible.builtin.command:
+    argv: [ip, -j, address, show, to, "{{ zabbix_onboarding_management_ip }}/32"]
+  register: _zabbix_onboarding_management_address
+  changed_when: false
+  failed_when: >-
+    _zabbix_onboarding_management_address.rc != 0 or
+    (_zabbix_onboarding_management_address.stdout | from_json | length) != 1 or
+    (_zabbix_onboarding_management_address.stdout | from_json)[0].ifname | default('') | length == 0
+  become: true
+
+- name: Store management interface
+  ansible.builtin.set_fact:
+    _zabbix_onboarding_management_interface: "{{ (_zabbix_onboarding_management_address.stdout | from_json)[0].ifname }}"
+  changed_when: false
+
+- name: Resolve active zone for management interface exactly
+  ansible.builtin.command:
+    argv: [firewall-cmd, "--get-zone-of-interface={{ _zabbix_onboarding_management_interface }}"]
+  register: _zabbix_onboarding_management_zone
+  changed_when: false
+  failed_when: _zabbix_onboarding_management_zone.rc != 0 or _zabbix_onboarding_management_zone.stdout | trim | length == 0
+  become: true
+
+- name: Store exact management firewall zone
+  ansible.builtin.set_fact:
+    _zabbix_onboarding_firewall_zone: "{{ _zabbix_onboarding_management_zone.stdout | trim }}"
+  changed_when: false
+
+- name: Query forbidden broad runtime and permanent exposure
+  ansible.builtin.command:
+    argv: "{{ ['firewall-cmd', '--zone=' ~ _zabbix_onboarding_firewall_zone] + (item.permanent | ternary(['--permanent'], [])) + [item.query] }}"
+  loop:
+    - {permanent: false, query: --query-service=zabbix-agent}
+    - {permanent: true, query: --query-service=zabbix-agent}
+    - {permanent: false, query: --query-port=10050/tcp}
+    - {permanent: true, query: --query-port=10050/tcp}
+  register: _zabbix_onboarding_broad_queries
+  changed_when: false
+  failed_when: _zabbix_onboarding_broad_queries.rc != 1 or _zabbix_onboarding_broad_queries.stdout != 'no'
+  become: true
+
+- name: Set canonical server-only rich rule
+  ansible.builtin.set_fact:
+    _zabbix_onboarding_rich_rule: "rule family=\"ipv4\" source address=\"{{ zabbix_onboarding_server_ip }}/32\" port port=\"10050\" protocol=\"tcp\" accept"
+
+- name: Read runtime and permanent rich rule stores before mutation
+  ansible.builtin.command:
+    argv: "{{ ['firewall-cmd', '--zone=' ~ _zabbix_onboarding_firewall_zone] + (item | ternary(['--permanent'], [])) + ['--list-rich-rules'] }}"
+  loop: [false, true]
+  register: _zabbix_onboarding_rich_before
+  changed_when: false
+  failed_when: _zabbix_onboarding_rich_before.rc != 0
+  become: true
+
+- name: Reject any unowned Zabbix Agent rich-rule exposure
+  ansible.builtin.assert:
+    that:
+      - >-
+        item == _zabbix_onboarding_rich_rule or
+        ('service name="zabbix-agent"' not in item and 'port port="10050"' not in item)
+    fail_msg: "Unowned Zabbix Agent exposure exists in the runtime or permanent rich-rule store: {{ item }}"
+  loop: "{{ _zabbix_onboarding_rich_before.results | map(attribute='stdout_lines') | flatten }}"
+
+- name: Record whether the exact rule exists in each store
+  ansible.builtin.set_fact:
+    _zabbix_onboarding_rich_runtime_exists: "{{ _zabbix_onboarding_rich_rule in _zabbix_onboarding_rich_before.results[0].stdout_lines }}"
+    _zabbix_onboarding_rich_permanent_exists: "{{ _zabbix_onboarding_rich_rule in _zabbix_onboarding_rich_before.results[1].stdout_lines }}"
+
+- name: Add exact runtime server-only rich rule
+  ansible.builtin.command:
+    argv: [firewall-cmd, "--zone={{ _zabbix_onboarding_firewall_zone }}", "--add-rich-rule={{ _zabbix_onboarding_rich_rule }}"]
+  when: not _zabbix_onboarding_rich_runtime_exists
+  become: true
+
+- name: Add exact permanent server-only rich rule
+  ansible.builtin.command:
+    argv: [firewall-cmd, "--zone={{ _zabbix_onboarding_firewall_zone }}", --permanent, "--add-rich-rule={{ _zabbix_onboarding_rich_rule }}"]
+  when: not _zabbix_onboarding_rich_permanent_exists
+  become: true
+
+- name: Read runtime and permanent rich rule stores after mutation
+  ansible.builtin.command:
+    argv: "{{ ['firewall-cmd', '--zone=' ~ _zabbix_onboarding_firewall_zone] + (item | ternary(['--permanent'], [])) + ['--list-rich-rules'] }}"
+  loop: [false, true]
+  register: _zabbix_onboarding_rich_after
+  changed_when: false
+  failed_when: _zabbix_onboarding_rich_after.rc != 0
+  become: true
+
+- name: Initialize relevant post-mutation rich-rule subsets
+  ansible.builtin.set_fact:
+    _zabbix_onboarding_relevant_runtime_rules: []
+    _zabbix_onboarding_relevant_permanent_rules: []
+
+- name: Collect relevant runtime rich rules without regex interpretation
+  ansible.builtin.set_fact:
+    _zabbix_onboarding_relevant_runtime_rules: "{{ _zabbix_onboarding_relevant_runtime_rules + [item] }}"
+  loop: "{{ _zabbix_onboarding_rich_after.results[0].stdout_lines }}"
+  when: "'service name=\"zabbix-agent\"' in item or 'port port=\"10050\"' in item"
+
+- name: Collect relevant permanent rich rules without regex interpretation
+  ansible.builtin.set_fact:
+    _zabbix_onboarding_relevant_permanent_rules: "{{ _zabbix_onboarding_relevant_permanent_rules + [item] }}"
+  loop: "{{ _zabbix_onboarding_rich_after.results[1].stdout_lines }}"
+  when: "'service name=\"zabbix-agent\"' in item or 'port port=\"10050\"' in item"
+
+- name: Require exclusive ownership of Zabbix Agent rich-rule exposure
+  ansible.builtin.assert:
+    that:
+      - _zabbix_onboarding_relevant_runtime_rules == [_zabbix_onboarding_rich_rule]
+      - _zabbix_onboarding_relevant_permanent_rules == [_zabbix_onboarding_rich_rule]

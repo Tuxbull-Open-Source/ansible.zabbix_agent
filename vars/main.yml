@@ -1,0 +1,6 @@
+---
+_zabbix_onboarding_supported_distribution: Rocky
+_zabbix_onboarding_supported_major: "10"
+_zabbix_onboarding_managed_tag: managed-by
+_zabbix_onboarding_managed_tag_value: zabbix-agent-onboarding
+_zabbix_onboarding_psk_version_tag: zabbix-psk-version

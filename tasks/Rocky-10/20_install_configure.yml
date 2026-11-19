@@ -1,0 +1,206 @@
+---
+# community.zabbix 4.3.0 requests nonexistent selinux-policy-epel on EL10.
+# This wrapper owns the exact replacement policy transaction, then bypasses only
+# that upstream include. Repository, package, config, and service remain upstream.
+- name: Configure pinned official Zabbix repositories
+  ansible.builtin.include_role:
+    name: community.zabbix.zabbix_repo
+  vars:
+    zabbix_repo_version: "{{ zabbix_onboarding_zabbix_version }}"
+
+- name: Read the official Zabbix repository configuration
+  ansible.builtin.slurp:
+    src: /etc/yum.repos.d/zabbix.repo
+  register: _zabbix_onboarding_zabbix_repo
+  become: true
+
+- name: Require exact official EL10 repository identity and signature policy
+  ansible.builtin.assert:
+    that:
+      - (_zabbix_onboarding_zabbix_repo.content | b64decode) is search('(?m)^\\[zabbix\\]$')
+      - (_zabbix_onboarding_zabbix_repo.content | b64decode) is search('(?m)^baseurl = https://repo\.zabbix\.com/zabbix/8\.0/stable/rhel/10/\$basearch/$')
+      - (_zabbix_onboarding_zabbix_repo.content | b64decode) is search('(?m)^gpgcheck = 1$')
+      - (_zabbix_onboarding_zabbix_repo.content | b64decode) is search('(?m)^gpgkey = file:///etc/pki/rpm-gpg/RPM-GPG-KEY-ZABBIX-B5333005$')
+
+- name: Resolve exact Rocky targeted-extra policy
+  ansible.builtin.command:
+    argv: [dnf, -q, "--disablerepo=*", "--enablerepo=crb", repoquery, --available, --qf, "%{name}-%{evr}|%{repoid}", "selinux-policy-targeted-extra-{{ zabbix_onboarding_selinux_policy_targeted_extra_evr }}"]
+  register: _zabbix_onboarding_targeted_policy
+  changed_when: false
+  failed_when: _zabbix_onboarding_targeted_policy.stdout_lines != ['selinux-policy-targeted-extra-' ~ zabbix_onboarding_selinux_policy_targeted_extra_evr ~ '|crb']
+  become: true
+
+- name: Resolve exact official Zabbix SELinux policy
+  ansible.builtin.command:
+    argv: [dnf, -q, "--disablerepo=*", "--enablerepo=zabbix", repoquery, --available, --qf, "%{name}-%{evr}|%{repoid}", "zabbix-selinux-policy-{{ zabbix_onboarding_zabbix_selinux_policy_evr }}"]
+  register: _zabbix_onboarding_zabbix_policy
+  changed_when: false
+  failed_when: _zabbix_onboarding_zabbix_policy.stdout_lines != ['zabbix-selinux-policy-' ~ zabbix_onboarding_zabbix_selinux_policy_evr ~ '|zabbix']
+  become: true
+
+- name: Install exact enforcing SELinux policy packages
+  ansible.builtin.dnf:
+    name:
+      - "selinux-policy-targeted-extra-{{ zabbix_onboarding_selinux_policy_targeted_extra_evr }}"
+      - "zabbix-selinux-policy-{{ zabbix_onboarding_zabbix_selinux_policy_evr }}"
+    state: present
+    disablerepo: "*"
+    enablerepo: [baseos, crb, zabbix]
+    disable_gpg_check: false
+  become: true
+
+- name: Verify installed policy EVRs and package signing keys
+  ansible.builtin.command:
+    argv: [rpm, -q, --qf, "%{name}-%{evr}|%{RSAHEADER:pgpsig}\\n", "{{ item.name }}"]
+  loop:
+    - {name: selinux-policy-targeted-extra, evr: "{{ zabbix_onboarding_selinux_policy_targeted_extra_evr }}", key: 6fedfc85}
+    - {name: zabbix-selinux-policy, evr: "{{ zabbix_onboarding_zabbix_selinux_policy_evr }}", key: b5333005}
+  register: _zabbix_onboarding_policy_signatures
+  changed_when: false
+  failed_when: >-
+    _zabbix_onboarding_policy_signatures.rc != 0 or
+    not _zabbix_onboarding_policy_signatures.stdout.startswith(item.name ~ '-' ~ item.evr ~ '|') or
+    (_zabbix_onboarding_policy_signatures.stdout | lower |
+    regex_search('key id (?:[0-9a-f]{8})?' ~ item.key ~ '(?:\\s|$)')) is none
+  become: true
+
+- name: Require enforcing mode before scoped upstream workaround
+  ansible.builtin.command: getenforce
+  register: _zabbix_onboarding_enforcing_before
+  changed_when: false
+  failed_when: _zabbix_onboarding_enforcing_before.stdout != 'Enforcing'
+
+- name: Configure exact Agent2 package and PSK through pinned upstream role
+  block:
+    - name: Save complete SELinux fact
+      ansible.builtin.set_fact:
+        _zabbix_onboarding_original_selinux: "{{ ansible_facts.selinux | combine({}) }}"
+    - name: Hide SELinux only from broken upstream include
+      ansible.builtin.set_fact:
+        ansible_facts: "{{ ansible_facts | combine({'selinux': ansible_facts.selinux | combine({'status': 'disabled'})}, recursive=True) }}"
+    - name: Run upstream Agent2 installer and configuration
+      ansible.builtin.include_role:
+        name: community.zabbix.zabbix_agent
+        apply:
+          no_log: true
+          diff: false
+      vars:
+        zabbix_manage_repo: false
+        zabbix_agent_version: "{{ zabbix_onboarding_zabbix_version }}"
+        zabbix_agent_version_minor: "{{ zabbix_onboarding_agent_release }}"
+        zabbix_agent2: true
+        zabbix_agent_install_agent_only: true
+        zabbix_agent_server: "{{ zabbix_onboarding_server_ip }}"
+        # Passive-only topology: upstream comments ServerActive when explicitly null.
+        zabbix_agent_serveractive: null
+        zabbix_agent_listenip: "{{ zabbix_onboarding_management_ip }}"
+        # The upstream default enables an unnecessary wildcard status endpoint.
+        zabbix_agent_statusport: null
+        zabbix_agent_hostname: "{{ zabbix_onboarding_host_name }}"
+        zabbix_agent_tlsaccept: psk
+        zabbix_agent_tlsconnect: psk
+        zabbix_agent_tlspsk_auto: false
+        zabbix_agent_tlspskfile: "{{ zabbix_onboarding_psk_path }}"
+        zabbix_agent_tlspsk_secret: "{{ zabbix_onboarding_psk }}"
+        zabbix_agent_tlspskidentity: "{{ zabbix_onboarding_psk_identity }}"
+        zabbix_api_create_hostgroup: false
+        zabbix_api_create_hosts: false
+  always:
+    - name: Restore complete SELinux fact
+      ansible.builtin.set_fact:
+        ansible_facts: "{{ ansible_facts | combine({'selinux': _zabbix_onboarding_original_selinux}, recursive=False) }}"
+      when: _zabbix_onboarding_original_selinux is defined
+
+- name: Verify SELinux fact and kernel enforcement after upstream role
+  ansible.builtin.command: getenforce
+  register: _zabbix_onboarding_enforcing_after
+  changed_when: false
+  failed_when: >-
+    _zabbix_onboarding_enforcing_after.stdout != 'Enforcing' or
+    ansible_facts.selinux != _zabbix_onboarding_original_selinux
+
+- name: Verify exact installed Agent2 EVR and signing key
+  ansible.builtin.command:
+    argv: [rpm, -q, --qf, "%{name}-%{evr}|%{RSAHEADER:pgpsig}\\n", zabbix-agent2]
+  register: _zabbix_onboarding_agent_signature
+  changed_when: false
+  failed_when: >-
+    _zabbix_onboarding_agent_signature.rc != 0 or
+    not _zabbix_onboarding_agent_signature.stdout.startswith('zabbix-agent2-' ~ zabbix_onboarding_agent_evr ~ '|') or
+    (_zabbix_onboarding_agent_signature.stdout | lower |
+    regex_search('key id (?:[0-9a-f]{8})?b5333005(?:\\s|$)')) is none
+  become: true
+
+- name: Inspect Agent2 configuration and PSK metadata without reading the secret
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+  loop:
+    - /etc/zabbix/zabbix_agent2.conf
+    - "{{ zabbix_onboarding_psk_path }}"
+  register: _zabbix_onboarding_agent_files
+  become: true
+
+- name: Require exact Agent2 configuration and PSK file protection
+  ansible.builtin.assert:
+    that:
+      - _zabbix_onboarding_agent_files.results[0].stat.isreg
+      - not _zabbix_onboarding_agent_files.results[0].stat.islnk
+      - _zabbix_onboarding_agent_files.results[0].stat.pw_name == 'root'
+      - _zabbix_onboarding_agent_files.results[0].stat.gr_name == 'root'
+      - _zabbix_onboarding_agent_files.results[0].stat.mode == '0644'
+      - _zabbix_onboarding_agent_files.results[1].stat.isreg
+      - not _zabbix_onboarding_agent_files.results[1].stat.islnk
+      - _zabbix_onboarding_agent_files.results[1].stat.pw_name == 'zabbix'
+      - _zabbix_onboarding_agent_files.results[1].stat.gr_name == 'zabbix'
+      - _zabbix_onboarding_agent_files.results[1].stat.mode == '0400'
+
+- name: Verify exact non-secret Agent2 configuration directives
+  ansible.builtin.command:
+    argv: [grep, -F, -x, "{{ item }}", /etc/zabbix/zabbix_agent2.conf]
+  loop:
+    - "Server={{ zabbix_onboarding_server_ip }}"
+    - "# ServerActive="
+    - "ListenIP={{ zabbix_onboarding_management_ip }}"
+    - "# StatusPort="
+    - TLSAccept=psk
+    - TLSConnect=psk
+    - "TLSPSKFile={{ zabbix_onboarding_psk_path }}"
+    - "TLSPSKIdentity={{ zabbix_onboarding_psk_identity }}"
+  register: _zabbix_onboarding_agent_config
+  changed_when: false
+  failed_when: _zabbix_onboarding_agent_config.rc != 0 or _zabbix_onboarding_agent_config.stdout_lines != [item]
+  become: true
+
+- name: Verify Agent2 service is enabled and active
+  ansible.builtin.command:
+    argv: [systemctl, "{{ item.command }}", zabbix-agent2]
+  loop:
+    - {command: is-enabled, expected: enabled}
+    - {command: is-active, expected: active}
+  register: _zabbix_onboarding_agent_service
+  changed_when: false
+  failed_when: _zabbix_onboarding_agent_service.rc != 0 or _zabbix_onboarding_agent_service.stdout != item.expected
+  become: true
+
+- name: Read exact Agent2 listening socket
+  ansible.builtin.command:
+    argv: [ss, -H, -ltnp]
+  register: _zabbix_onboarding_agent_listener
+  changed_when: false
+  failed_when: _zabbix_onboarding_agent_listener.rc != 0
+  become: true
+
+- name: Require one exact management listener owned by Agent2
+  ansible.builtin.assert:
+    that:
+      - >-
+        _zabbix_onboarding_agent_listener.stdout_lines |
+        select('search', '"zabbix_agent2"') |
+        select('match', '^LISTEN\s+\d+\s+\d+\s+' ~
+        (zabbix_onboarding_management_ip | regex_escape) ~ ':10050\s+\S+\s+users:') |
+        list | length == 1
+      - >-
+        _zabbix_onboarding_agent_listener.stdout_lines |
+        select('search', '"zabbix_agent2"') | list | length == 1
+    fail_msg: Zabbix Agent 2 has an unexpected non-management or auxiliary listener.

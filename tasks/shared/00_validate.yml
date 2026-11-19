@@ -1,0 +1,106 @@
+---
+- name: Validate platform, topology, secrets, and fixed release inputs
+  ansible.builtin.assert:
+    that:
+      - ansible_distribution == _zabbix_onboarding_supported_distribution
+      - ansible_distribution_major_version | string == _zabbix_onboarding_supported_major
+      - ansible_selinux.status | default('disabled') == 'enabled'
+      - ansible_selinux.mode | default('') | lower == zabbix_onboarding_expected_selinux_state | lower
+      - zabbix_onboarding_api_delegate is string and zabbix_onboarding_api_delegate | length > 0
+      - zabbix_onboarding_validation_only or zabbix_onboarding_api_delegate in hostvars
+      - zabbix_onboarding_api_url == 'http://127.0.0.1:8080/api_jsonrpc.php'
+      - zabbix_onboarding_api_user == 'Admin'
+      - zabbix_onboarding_api_password is defined
+      - zabbix_onboarding_api_password is string and zabbix_onboarding_api_password | length > 0
+      - zabbix_onboarding_server_ip is ansible.utils.ipv4
+      - zabbix_onboarding_management_ip is ansible.utils.ipv4
+      - zabbix_onboarding_server_ip != zabbix_onboarding_management_ip
+      - zabbix_onboarding_psk is defined
+      - zabbix_onboarding_psk is match('^[0-9a-f]{64}$')
+      - zabbix_onboarding_psk_version is defined
+      - zabbix_onboarding_psk_version | string is match('^[1-9][0-9]*$')
+      - zabbix_onboarding_psk_identity is match('^[A-Za-z0-9._:-]{1,128}$')
+      - zabbix_onboarding_host_name is match('^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$')
+      - zabbix_onboarding_visible_name is string and zabbix_onboarding_visible_name | length > 0
+      - zabbix_onboarding_visible_name | length <= 128
+      - zabbix_onboarding_host_group == 'Linux servers'
+      - zabbix_onboarding_template == 'Linux by Zabbix agent'
+      - zabbix_onboarding_adopt_existing is boolean
+      - zabbix_onboarding_zabbix_version == '8.0'
+      - zabbix_onboarding_agent_release is match('^[0-9]+-release[0-9]+\\.el10$')
+      - zabbix_onboarding_selinux_policy_targeted_extra_evr == '42.1.27-2.el10_3.2'
+      - zabbix_onboarding_zabbix_selinux_policy_evr == '2:8.0.0-release1.el10'
+      - zabbix_onboarding_agent_evr == '2:8.0.0-release1.el10'
+      - zabbix_onboarding_psk_path == '/etc/zabbix/agent2.psk'
+      - zabbix_onboarding_psk_marker_path == '/var/lib/zabbix-agent-onboarding/psk-state'
+    fail_msg: Refusing unsafe or unsupported Zabbix Agent2 onboarding input.
+  no_log: true
+  diff: false
+
+- name: Reject unsupported check mode before mutation
+  ansible.builtin.assert:
+    that: not ansible_check_mode
+    fail_msg: Use zabbix_onboarding_validation_only=true for controller-only validation.
+  when: not (zabbix_onboarding_validation_only | bool)
+
+- name: Stop after controller-only validation
+  ansible.builtin.meta: end_role
+  when: zabbix_onboarding_validation_only | bool
+
+- name: Inspect versioned PSK marker before any target mutation
+  ansible.builtin.stat:
+    path: "{{ zabbix_onboarding_psk_marker_path }}"
+    follow: false
+  register: _zabbix_onboarding_psk_marker_stat
+  become: true
+  no_log: true
+  diff: false
+
+- name: Require an exact protected PSK marker file
+  ansible.builtin.assert:
+    that:
+      - not _zabbix_onboarding_psk_marker_stat.stat.exists or _zabbix_onboarding_psk_marker_stat.stat.isreg
+      - not _zabbix_onboarding_psk_marker_stat.stat.exists or not _zabbix_onboarding_psk_marker_stat.stat.islnk
+      - not _zabbix_onboarding_psk_marker_stat.stat.exists or _zabbix_onboarding_psk_marker_stat.stat.pw_name == 'root'
+      - not _zabbix_onboarding_psk_marker_stat.stat.exists or _zabbix_onboarding_psk_marker_stat.stat.gr_name == 'root'
+      - not _zabbix_onboarding_psk_marker_stat.stat.exists or _zabbix_onboarding_psk_marker_stat.stat.mode == '0600'
+    fail_msg: Existing PSK marker is not an exact root:root 0600 regular file.
+  no_log: true
+  diff: false
+
+- name: Read existing versioned PSK marker
+  ansible.builtin.slurp:
+    src: "{{ zabbix_onboarding_psk_marker_path }}"
+  register: _zabbix_onboarding_psk_marker_slurp
+  when: _zabbix_onboarding_psk_marker_stat.stat.exists
+  become: true
+  no_log: true
+  diff: false
+
+- name: Persist existing PSK marker text for later API recovery checks
+  ansible.builtin.set_fact:
+    _zabbix_onboarding_marker_exists: "{{ _zabbix_onboarding_psk_marker_stat.stat.exists | bool }}"
+    _zabbix_onboarding_marker_text: >-
+      {{ (_zabbix_onboarding_psk_marker_slurp.content | b64decode)
+         if _zabbix_onboarding_psk_marker_stat.stat.exists else '' }}
+  no_log: true
+  diff: false
+
+- name: Persist parsed PSK marker facts for later API recovery checks
+  ansible.builtin.set_fact:
+    _zabbix_onboarding_marker_version: "{{ (_zabbix_onboarding_marker_text | regex_findall('^version=([1-9][0-9]*)$', multiline=True) | first) | default('') }}"
+    _zabbix_onboarding_marker_hash: "{{ (_zabbix_onboarding_marker_text | regex_findall('^sha256=([0-9a-f]{64})$', multiline=True) | first) | default('') }}"
+    _zabbix_onboarding_marker_identity_hash: "{{ (_zabbix_onboarding_marker_text | regex_findall('^identity_sha256=([0-9a-f]{64})$', multiline=True) | first) | default('') }}"
+  no_log: true
+  diff: false
+
+- name: Validate existing versioned PSK marker and reject unversioned secret changes
+  ansible.builtin.assert:
+    that:
+      - _zabbix_onboarding_marker_text is match('^version=[1-9][0-9]*\\nsha256=[0-9a-f]{64}\\nidentity_sha256=[0-9a-f]{64}\\n$')
+      - _zabbix_onboarding_marker_version != zabbix_onboarding_psk_version | string or _zabbix_onboarding_marker_hash == zabbix_onboarding_psk | hash('sha256')
+      - _zabbix_onboarding_marker_version != zabbix_onboarding_psk_version | string or _zabbix_onboarding_marker_identity_hash == zabbix_onboarding_psk_identity | hash('sha256')
+    fail_msg: PSK or PSK identity changed without a zabbix_onboarding_psk_version bump.
+  when: _zabbix_onboarding_marker_exists
+  no_log: true
+  diff: false

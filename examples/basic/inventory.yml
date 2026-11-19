@@ -1,0 +1,18 @@
+---
+all:
+  children:
+    zabbix_agents:
+      hosts:
+        app-01.example.test:
+          ansible_host: 192.0.2.20
+          zabbix_onboarding_api_delegate: zabbix-01.example.test
+          zabbix_onboarding_server_ip: 192.0.2.10
+          zabbix_onboarding_management_ip: 192.0.2.20
+          zabbix_onboarding_host_name: app-01
+          zabbix_onboarding_visible_name: Application 01
+          zabbix_onboarding_psk_identity: zabbix-agent2-app-01
+          zabbix_onboarding_psk_version: "1"
+    zabbix_servers:
+      hosts:
+        zabbix-01.example.test:
+          ansible_host: 192.0.2.10

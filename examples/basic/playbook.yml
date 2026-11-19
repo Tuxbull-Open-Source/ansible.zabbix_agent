@@ -1,0 +1,12 @@
+---
+- name: Onboard Zabbix agents
+  hosts: zabbix_agents
+  gather_facts: true
+  become: true
+  vars_files:
+    - vault.yml
+  vars:
+    zabbix_onboarding_api_password: "{{ vault_zabbix_api_password }}"
+    zabbix_onboarding_psk: "{{ vault_zabbix_agent_psks[inventory_hostname] }}"
+  roles:
+    - role: tuxbull.zabbix_agent

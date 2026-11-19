@@ -1,0 +1,324 @@
+---
+- name: Authenticate and manage host through delegated Zabbix API
+  no_log: true
+  diff: false
+  block:
+    - name: Authenticate desired Admin credential through delegated loopback API
+      ansible.builtin.uri:
+        url: "{{ zabbix_onboarding_api_url }}"
+        method: POST
+        body_format: json
+        body:
+          jsonrpc: "2.0"
+          method: user.login
+          params: {username: "{{ zabbix_onboarding_api_user }}", password: "{{ zabbix_onboarding_api_password }}", userData: true}
+          id: 1
+        return_content: true
+        use_proxy: false
+        status_code: 200
+      delegate_to: "{{ zabbix_onboarding_api_delegate }}"
+      register: _zabbix_onboarding_login
+      failed_when: >-
+        _zabbix_onboarding_login.json is not mapping or
+        _zabbix_onboarding_login.json.jsonrpc | default('') != '2.0' or
+        _zabbix_onboarding_login.json.id | default(-1) | int != 1 or
+        _zabbix_onboarding_login.json.error is defined or
+        _zabbix_onboarding_login.json.result is not mapping or
+        _zabbix_onboarding_login.json.result.sessionid is not defined or
+        _zabbix_onboarding_login.json.result.sessionid is not string or
+        _zabbix_onboarding_login.json.result.sessionid | length == 0
+
+    - name: Resolve exact template, group, and technical host
+      ansible.builtin.uri:
+        url: "{{ zabbix_onboarding_api_url }}"
+        method: POST
+        headers: {Authorization: "Bearer {{ _zabbix_onboarding_login.json.result.sessionid }}"}
+        body_format: json
+        body: {jsonrpc: "2.0", method: "{{ item.method }}", params: "{{ item.params }}", id: "{{ item.id }}"}
+        return_content: true
+        use_proxy: false
+        status_code: 200
+      loop:
+        - {id: 2, method: template.get, params: {output: [templateid, host], filter: {host: ["{{ zabbix_onboarding_template }}"]}}}
+        - {id: 3, method: hostgroup.get, params: {output: [groupid, name], filter: {name: ["{{ zabbix_onboarding_host_group }}"]}}}
+        - id: 4
+          method: host.get
+          params:
+            output: [hostid, host, name, status, monitored_by, tls_accept, tls_connect]
+            selectInterfaces: [interfaceid, type, main, useip, ip, dns, port]
+            selectHostGroups: [groupid, name]
+            selectParentTemplates: [templateid, host]
+            selectTags: [tag, value]
+            filter: {host: ["{{ zabbix_onboarding_host_name }}"]}
+      delegate_to: "{{ zabbix_onboarding_api_delegate }}"
+      register: _zabbix_onboarding_discovery
+      failed_when: >-
+        _zabbix_onboarding_discovery.json is not mapping or
+        _zabbix_onboarding_discovery.json.jsonrpc | default('') != '2.0' or
+        _zabbix_onboarding_discovery.json.id | default(-1) | int != item.id | int or
+        _zabbix_onboarding_discovery.json.error is defined or
+        _zabbix_onboarding_discovery.json.result is not sequence or
+        _zabbix_onboarding_discovery.json.result is string
+
+    - name: Require unique exact dependencies and technical host
+      ansible.builtin.assert:
+        that:
+          - _zabbix_onboarding_discovery.results[0].json.result | length == 1
+          - _zabbix_onboarding_discovery.results[0].json.result[0].host == zabbix_onboarding_template
+          - _zabbix_onboarding_discovery.results[1].json.result | length == 1
+          - _zabbix_onboarding_discovery.results[1].json.result[0].name == zabbix_onboarding_host_group
+          - _zabbix_onboarding_discovery.results[2].json.result | length <= 1
+
+    - name: Store resolved API state
+      ansible.builtin.set_fact:
+        _zabbix_onboarding_template_id: "{{ _zabbix_onboarding_discovery.results[0].json.result[0].templateid | string }}"
+        _zabbix_onboarding_group_id: "{{ _zabbix_onboarding_discovery.results[1].json.result[0].groupid | string }}"
+        _zabbix_onboarding_existing: "{{ _zabbix_onboarding_discovery.results[2].json.result }}"
+
+    - name: Derive existing host ownership and PSK version
+      ansible.builtin.set_fact:
+        _zabbix_onboarding_existing_managed: >-
+          {{ _zabbix_onboarding_existing | length == 1 and
+             {'tag': _zabbix_onboarding_managed_tag, 'value': _zabbix_onboarding_managed_tag_value}
+             in (_zabbix_onboarding_existing[0].tags | default([])) }}
+        _zabbix_onboarding_existing_psk_versions: >-
+          {{ (_zabbix_onboarding_existing[0].tags | default([]) |
+              selectattr('tag', 'equalto', _zabbix_onboarding_psk_version_tag) |
+              map(attribute='value') | list)
+             if _zabbix_onboarding_existing | length == 1 else [] }}
+
+    - name: Refuse unowned existing host unless explicitly adopted
+      ansible.builtin.assert:
+        that:
+          - _zabbix_onboarding_existing | length == 0 or _zabbix_onboarding_existing_managed or zabbix_onboarding_adopt_existing
+          - _zabbix_onboarding_existing | length == 0 or not _zabbix_onboarding_existing_managed or _zabbix_onboarding_existing_psk_versions | length == 1
+          - _zabbix_onboarding_existing | length == 0 or not _zabbix_onboarding_existing_managed or _zabbix_onboarding_existing_psk_versions[0] is match('^[1-9][0-9]*$')
+        fail_msg: Existing host is unowned or has invalid managed PSK-version state; explicit adoption is required only for unowned hosts.
+
+    - name: Refuse ambiguous recovery of an existing managed PSK
+      ansible.builtin.assert:
+        that:
+          - >-
+            _zabbix_onboarding_existing | length == 0 or
+            not _zabbix_onboarding_existing_managed or
+            _zabbix_onboarding_existing_psk_versions[0] != (zabbix_onboarding_psk_version | string) or
+            (_zabbix_onboarding_marker_exists and
+             _zabbix_onboarding_marker_version == (zabbix_onboarding_psk_version | string))
+        fail_msg: >-
+          Existing managed host already has the requested PSK version, but the local
+          PSK marker is absent or stale. Bump zabbix_onboarding_psk_version to force a safe rotation.
+      no_log: false
+
+    - name: Build explicit desired readable and secret API state
+      ansible.builtin.set_fact:
+        _zabbix_onboarding_desired_readable:
+          host: "{{ zabbix_onboarding_host_name }}"
+          name: "{{ zabbix_onboarding_visible_name }}"
+          status: 0
+          monitored_by: 0
+          interfaces:
+            - {type: "1", main: "1", useip: "1", ip: "{{ zabbix_onboarding_management_ip }}", dns: "", port: "10050"}
+          groups: [{groupid: "{{ _zabbix_onboarding_group_id }}"}]
+          templates: [{templateid: "{{ _zabbix_onboarding_template_id }}"}]
+          tags:
+            - {tag: "{{ _zabbix_onboarding_managed_tag }}", value: "{{ _zabbix_onboarding_managed_tag_value }}"}
+            - {tag: "{{ _zabbix_onboarding_psk_version_tag }}", value: "{{ zabbix_onboarding_psk_version | string }}"}
+          tls_accept: 2
+          tls_connect: 2
+        _zabbix_onboarding_desired_secret:
+          tls_psk_identity: "{{ zabbix_onboarding_psk_identity }}"
+          tls_psk: "{{ zabbix_onboarding_psk }}"
+
+    - name: Normalize existing readable API state
+      ansible.builtin.set_fact:
+        _zabbix_onboarding_existing_readable: >-
+          {{ {
+            'host': _zabbix_onboarding_existing[0].host,
+            'name': _zabbix_onboarding_existing[0].name,
+            'status': _zabbix_onboarding_existing[0].status | int,
+            'monitored_by': _zabbix_onboarding_existing[0].monitored_by | int,
+            'interfaces': _zabbix_onboarding_existing[0].interfaces |
+              map('dict2items') | map('rejectattr', 'key', 'equalto', 'interfaceid') |
+              map('items2dict') | list,
+            'groups': _zabbix_onboarding_existing[0].hostgroups |
+              map('dict2items') | map('selectattr', 'key', 'equalto', 'groupid') |
+              map('items2dict') | list,
+            'templates': _zabbix_onboarding_existing[0].parentTemplates |
+              map('dict2items') | map('selectattr', 'key', 'equalto', 'templateid') |
+              map('items2dict') | list,
+            'tags': _zabbix_onboarding_existing[0].tags,
+            'tls_accept': _zabbix_onboarding_existing[0].tls_accept | int,
+            'tls_connect': _zabbix_onboarding_existing[0].tls_connect | int
+          } }}
+      when: _zabbix_onboarding_existing | length == 1
+
+    - name: Decide whether update and PSK rotation are required
+      ansible.builtin.set_fact:
+        _zabbix_onboarding_version_changed: >-
+          {{ _zabbix_onboarding_existing | length == 1 and
+             (not _zabbix_onboarding_existing_managed or
+              _zabbix_onboarding_existing_psk_versions[0] != (zabbix_onboarding_psk_version | string)) }}
+        _zabbix_onboarding_readable_changed: >-
+          {{ _zabbix_onboarding_existing | length == 1 and
+             _zabbix_onboarding_existing_readable != _zabbix_onboarding_desired_readable }}
+        _zabbix_onboarding_adopting: >-
+          {{ _zabbix_onboarding_existing | length == 1 and not _zabbix_onboarding_existing_managed and zabbix_onboarding_adopt_existing }}
+
+    - name: Create absent host with exact desired state and PSK
+      ansible.builtin.uri:
+        url: "{{ zabbix_onboarding_api_url }}"
+        method: POST
+        headers: {Authorization: "Bearer {{ _zabbix_onboarding_login.json.result.sessionid }}"}
+        body_format: json
+        body:
+          jsonrpc: "2.0"
+          method: host.create
+          params: "{{ _zabbix_onboarding_desired_readable | combine(_zabbix_onboarding_desired_secret) }}"
+          id: 5
+        return_content: true
+        use_proxy: false
+        status_code: 200
+      delegate_to: "{{ zabbix_onboarding_api_delegate }}"
+      register: _zabbix_onboarding_create
+      changed_when: true
+      when: _zabbix_onboarding_existing | length == 0
+      failed_when: >-
+        _zabbix_onboarding_create.json is not mapping or
+        _zabbix_onboarding_create.json.jsonrpc | default('') != '2.0' or
+        _zabbix_onboarding_create.json.id | default(-1) | int != 5 or
+        _zabbix_onboarding_create.json.error is defined or
+        _zabbix_onboarding_create.json.result.hostids is not sequence or
+        _zabbix_onboarding_create.json.result.hostids is string or
+        _zabbix_onboarding_create.json.result.hostids | length != 1
+
+    - name: Update only drifted owned or explicitly adopted host
+      ansible.builtin.uri:
+        url: "{{ zabbix_onboarding_api_url }}"
+        method: POST
+        headers: {Authorization: "Bearer {{ _zabbix_onboarding_login.json.result.sessionid }}"}
+        body_format: json
+        body:
+          jsonrpc: "2.0"
+          method: host.update
+          params: >-
+            {{ _zabbix_onboarding_desired_readable |
+               combine({'hostid': _zabbix_onboarding_existing[0].hostid}) |
+               combine(((_zabbix_onboarding_version_changed or _zabbix_onboarding_adopting) |
+                        ternary(_zabbix_onboarding_desired_secret, {}))) }}
+          id: 6
+        return_content: true
+        use_proxy: false
+        status_code: 200
+      delegate_to: "{{ zabbix_onboarding_api_delegate }}"
+      register: _zabbix_onboarding_update
+      changed_when: true
+      when:
+        - _zabbix_onboarding_existing | length == 1
+        - _zabbix_onboarding_readable_changed or _zabbix_onboarding_version_changed or _zabbix_onboarding_adopting
+      failed_when: >-
+        _zabbix_onboarding_update.json is not mapping or
+        _zabbix_onboarding_update.json.jsonrpc | default('') != '2.0' or
+        _zabbix_onboarding_update.json.id | default(-1) | int != 6 or
+        _zabbix_onboarding_update.json.error is defined or
+        _zabbix_onboarding_update.json.result.hostids is not sequence or
+        _zabbix_onboarding_update.json.result.hostids is string or
+        _zabbix_onboarding_update.json.result.hostids != [_zabbix_onboarding_existing[0].hostid]
+
+    - name: Read back exact registered host state
+      ansible.builtin.uri:
+        url: "{{ zabbix_onboarding_api_url }}"
+        method: POST
+        headers: {Authorization: "Bearer {{ _zabbix_onboarding_login.json.result.sessionid }}"}
+        body_format: json
+        body:
+          jsonrpc: "2.0"
+          method: host.get
+          params:
+            output: [hostid, host, name, status, monitored_by, tls_accept, tls_connect]
+            selectInterfaces: [interfaceid, type, main, useip, ip, dns, port]
+            selectHostGroups: [groupid, name]
+            selectParentTemplates: [templateid, host]
+            selectTags: [tag, value]
+            filter: {host: ["{{ zabbix_onboarding_host_name }}"]}
+          id: 7
+        return_content: true
+        use_proxy: false
+        status_code: 200
+      delegate_to: "{{ zabbix_onboarding_api_delegate }}"
+      register: _zabbix_onboarding_readback
+      failed_when: >-
+        _zabbix_onboarding_readback.json is not mapping or
+        _zabbix_onboarding_readback.json.jsonrpc | default('') != '2.0' or
+        _zabbix_onboarding_readback.json.id | default(-1) | int != 7 or
+        _zabbix_onboarding_readback.json.error is defined or
+        _zabbix_onboarding_readback.json.result is not sequence or
+        _zabbix_onboarding_readback.json.result is string
+
+    - name: Normalize exact API readback
+      ansible.builtin.set_fact:
+        _zabbix_onboarding_readback_readable: >-
+          {{ {
+            'host': _zabbix_onboarding_readback.json.result[0].host,
+            'name': _zabbix_onboarding_readback.json.result[0].name,
+            'status': _zabbix_onboarding_readback.json.result[0].status | int,
+            'monitored_by': _zabbix_onboarding_readback.json.result[0].monitored_by | int,
+            'interfaces': _zabbix_onboarding_readback.json.result[0].interfaces |
+              map('dict2items') | map('rejectattr', 'key', 'equalto', 'interfaceid') |
+              map('items2dict') | list,
+            'groups': _zabbix_onboarding_readback.json.result[0].hostgroups |
+              map('dict2items') | map('selectattr', 'key', 'equalto', 'groupid') |
+              map('items2dict') | list,
+            'templates': _zabbix_onboarding_readback.json.result[0].parentTemplates |
+              map('dict2items') | map('selectattr', 'key', 'equalto', 'templateid') |
+              map('items2dict') | list,
+            'tags': _zabbix_onboarding_readback.json.result[0].tags,
+            'tls_accept': _zabbix_onboarding_readback.json.result[0].tls_accept | int,
+            'tls_connect': _zabbix_onboarding_readback.json.result[0].tls_connect | int
+          } }}
+      failed_when: _zabbix_onboarding_readback.json.result | length != 1
+
+    - name: Verify unique exact readable API readback
+      ansible.builtin.assert:
+        that:
+          - _zabbix_onboarding_readback.json.result | length == 1
+          - _zabbix_onboarding_readback_readable == _zabbix_onboarding_desired_readable
+
+    - name: Create root-only PSK marker directory after verified API readback
+      ansible.builtin.file:
+        path: "{{ zabbix_onboarding_psk_marker_path | dirname }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+      become: true
+
+    - name: Record versioned PSK hash after verified API readback
+      ansible.builtin.copy:
+        dest: "{{ zabbix_onboarding_psk_marker_path }}"
+        content: |
+          version={{ zabbix_onboarding_psk_version | string }}
+          sha256={{ zabbix_onboarding_psk | hash('sha256') }}
+          identity_sha256={{ zabbix_onboarding_psk_identity | hash('sha256') }}
+        owner: root
+        group: root
+        mode: "0600"
+      become: true
+  always:
+    - name: Logout delegated API session without masking the primary result
+      ansible.builtin.uri:
+        url: "{{ zabbix_onboarding_api_url }}"
+        method: POST
+        headers: {Authorization: "Bearer {{ _zabbix_onboarding_login.json.result.sessionid }}"}
+        body_format: json
+        body: {jsonrpc: "2.0", method: user.logout, params: [], id: 8}
+        return_content: true
+        use_proxy: false
+        status_code: 200
+      delegate_to: "{{ zabbix_onboarding_api_delegate }}"
+      register: _zabbix_onboarding_logout
+      failed_when: false
+      changed_when: false
+      when:
+        - _zabbix_onboarding_login is defined
+        - _zabbix_onboarding_login.json is defined
+        - _zabbix_onboarding_login.json.result.sessionid is defined

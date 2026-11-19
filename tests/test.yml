@@ -1,0 +1,46 @@
+#!/usr/bin/ansible-playbook
+---
+- name: Validate tuxbull.zabbix_agent
+  hosts: localhost
+  gather_facts: false
+  vars:
+    ansible_distribution: Rocky
+    ansible_distribution_major_version: "10"
+    ansible_selinux: {status: enabled, mode: enforcing}
+    ansible_facts:
+      distribution: Rocky
+      distribution_major_version: "10"
+      os_family: RedHat
+      selinux: {status: enabled, mode: enforcing}
+    zabbix_onboarding_validation_only: true
+    zabbix_onboarding_api_delegate: zabbix-server
+    # Synthetic values used only by controller-side validation.
+    zabbix_onboarding_api_password: "{{ 'Validation' ~ 'PasswordNotUsed' }}"
+    zabbix_onboarding_server_ip: 192.0.2.10
+    zabbix_onboarding_management_ip: 192.0.2.20
+    zabbix_onboarding_psk: "{{ 'a' * 64 }}"
+    zabbix_onboarding_psk_version: "1"
+  roles:
+    - role: tuxbull.zabbix_agent
+  post_tasks:
+    - name: Load sanitized pinned-role repository fixture
+      ansible.builtin.set_fact:
+        _repo_fixture: "{{ lookup('ansible.builtin.file', playbook_dir ~ '/fixtures/zabbix.repo') }}"
+    - name: Exercise exact repository identity expressions
+      ansible.builtin.assert:
+        that:
+          - _repo_fixture is search('(?m)^\\[zabbix\\]$')
+          - _repo_fixture is search('(?m)^baseurl = https://repo\.zabbix\.com/zabbix/8\.0/stable/rhel/10/\$basearch/$')
+          - _repo_fixture is search('(?m)^gpgcheck = 1$')
+          - _repo_fixture is search('(?m)^gpgkey = file:///etc/pki/rpm-gpg/RPM-GPG-KEY-ZABBIX-B5333005$')
+    - name: Exercise canonical rich-rule ownership expressions
+      vars:
+        desired: 'rule family="ipv4" source address="192.0.2.10/32" port port="10050" protocol="tcp" accept'
+        unrelated: 'rule family="ipv4" source address="198.51.100.0/24" port port="22" protocol="tcp" accept'
+        conflicting: 'rule family="ipv4" source address="198.51.100.2/32" service name="zabbix-agent" reject'
+      ansible.builtin.assert:
+        that:
+          - desired == desired
+          - "'service name=\"zabbix-agent\"' not in unrelated and 'port port=\"10050\"' not in unrelated"
+          - "'service name=\"zabbix-agent\"' in conflicting or 'port port=\"10050\"' in conflicting"
+          - "[desired] == [desired]"

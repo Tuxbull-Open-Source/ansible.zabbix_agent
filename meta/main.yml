@@ -1,0 +1,13 @@
+---
+galaxy_info:
+  author: Tuxbull-Open-Source
+  namespace: tuxbull
+  role_name: zabbix_agent
+  description: Secure Rocky 10 Zabbix Agent2 onboarding wrapper
+  min_ansible_version: '2.15'
+  license: GPL-3.0-or-later
+  platforms:
+    - name: EL
+      versions: ['10']
+  galaxy_tags: [zabbix, monitoring, agent, rocky]
+dependencies: []

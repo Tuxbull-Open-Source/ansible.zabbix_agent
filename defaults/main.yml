@@ -1,0 +1,32 @@
+---
+# Controller-only validation mode; no target or API mutation occurs.
+zabbix_onboarding_validation_only: false
+
+# Zabbix server inventory hostname. SSH delegation must reach this host.
+zabbix_onboarding_api_delegate: ""
+zabbix_onboarding_api_url: http://127.0.0.1:8080/api_jsonrpc.php
+zabbix_onboarding_api_user: Admin
+# Required secret; define in a private vault.
+# zabbix_onboarding_api_password: ""
+
+# Required topology and per-host vault secret.
+zabbix_onboarding_server_ip: ""
+zabbix_onboarding_management_ip: ""
+# zabbix_onboarding_psk: exactly 64 lowercase hexadecimal characters
+# Bump this positive integer string whenever the PSK or identity is rotated.
+# zabbix_onboarding_psk_version: "1"
+zabbix_onboarding_psk_identity: "zabbix-agent2-{{ inventory_hostname }}"
+zabbix_onboarding_host_name: "{{ inventory_hostname }}"
+zabbix_onboarding_visible_name: "{{ inventory_hostname }}"
+zabbix_onboarding_host_group: Linux servers
+zabbix_onboarding_template: Linux by Zabbix agent
+zabbix_onboarding_adopt_existing: false
+
+zabbix_onboarding_zabbix_version: "8.0"
+zabbix_onboarding_agent_release: "0-release1.el10"
+zabbix_onboarding_agent_evr: "2:8.0.0-release1.el10"
+zabbix_onboarding_selinux_policy_targeted_extra_evr: "42.1.27-2.el10_3.2"
+zabbix_onboarding_zabbix_selinux_policy_evr: "2:8.0.0-release1.el10"
+zabbix_onboarding_expected_selinux_state: Enforcing
+zabbix_onboarding_psk_path: /etc/zabbix/agent2.psk
+zabbix_onboarding_psk_marker_path: /var/lib/zabbix-agent-onboarding/psk-state
