@@ -115,7 +115,9 @@ def api_play(path, port, marker, version='1', psk='a'*64, identity='zabbix-agent
     return subprocess.run(['ansible-playbook',str(path),'-i','localhost,','-c','local'],text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,env=env)
 
 # Parse all YAML and preserve protected template dispatcher bytes.
-for p in ROOT.rglob('*.yml'): list(yaml.safe_load_all(p.read_text()))
+for p in ROOT.rglob('*.yml'):
+    if 'collections' not in p.parts:
+        list(yaml.safe_load_all(p.read_text()))
 for rel in ('tasks/main.yml', 'tasks/include-file.yml'):
     require(hashlib.sha256((ROOT/rel).read_bytes()).hexdigest() == PROTECTED_SHA256[rel], f'{rel} changed')
 
@@ -249,7 +251,14 @@ with tempfile.TemporaryDirectory() as td:
 with tempfile.TemporaryDirectory() as td:
     h=pathlib.Path(td); (h/'roles').mkdir(); shutil.copytree(ROOT,h/'roles/tuxbull.zabbix_agent')
     (h/'ansible.cfg').write_text('[defaults]\nroles_path=roles\nretry_files_enabled=False\n')
-    env={'PATH':str(pathlib.Path(shutil.which('ansible-playbook')).parent)+':/usr/bin:/bin','HOME':str(h),'ANSIBLE_CONFIG':str(h/'ansible.cfg'),'PWD':str(h)}
+    env=os.environ.copy()
+    env.update({
+        'PATH': str(pathlib.Path(shutil.which('ansible-playbook')).parent)+':/usr/bin:/bin',
+        'HOME': str(h),
+        'ANSIBLE_CONFIG': str(h/'ansible.cfg'),
+        'ANSIBLE_COLLECTIONS_PATH': str(ROOT/'collections'),
+        'PWD': str(h),
+    })
     play=str(h/'roles/tuxbull.zabbix_agent/tests/test.yml')
     for extra in (['--syntax-check'],[]):
         result=subprocess.run(['ansible-playbook',play,'-i','localhost,','-c','local']+extra,cwd=h,env=env,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
